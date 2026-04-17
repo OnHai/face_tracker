@@ -1,0 +1,19 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables (if you add any later)
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+.venv/
+__pycache__/
+*.pyc
+*.mp4
+.git_backup/

@@ -1,0 +1,9 @@
+filterpy
+lap
+numpy
+onnxruntime
+opencv-python-headless
+scipy
+scikit-image
+tqdm
+
