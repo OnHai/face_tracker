@@ -1,0 +1,429 @@
+
+
+# debugging
+RUN_TARGET = "rpi"  # "rpi" or "pc"
+STREAM_PROTOCOL = "tcp"  # "tcp" or "udp" or "none"
+PC_VIDEO_PATH = r"sim_davu.mp4"
+ENABLE_CRAZYFLIE = True
+
+import math
+import time
+import cv2
+import numpy as np
+import vision.utils.box_utils_numpy as box_utils
+import onnxruntime as ort # type: ignore
+from sort import Sort
+import subprocess
+import logging
+
+if ENABLE_CRAZYFLIE:
+    import cflib.crtp
+    from cflib.crazyflie import Crazyflie
+    from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+    from cflib.crtp.serialdriver import SerialDriver
+if RUN_TARGET == "rpi":
+    from picamera2 import Picamera2 # type: ignore
+
+# ============================================================================
+
+# Network & Streaming
+IP = "0.0.0.0"
+PORT = 5005
+
+# Camera Settings
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+FRAME_RATE = 10 #20
+
+# Video Quality 
+VIDEO_QUALITY = 28  # lower = better quality
+VIDEO_PRESET = "ultrafast"  # ultrafast, superfast, veryfast
+BITRATE = "500k"  
+
+# Detection Settings
+MODEL_PATH = "models/onnx/version-RFB-320-perfect.onnx"
+CONFIDENCE_THRESHOLD = 0.7
+ONNX_THREADS = 2
+
+IOU_THRESHOLD = 0.1
+MAX_AGE = 15 #5
+MIN_HITS = 2 #3
+
+# Targeting Settings
+HFOV_DEGREES = 60.0
+DEADZONE_DEGREES = 5
+
+# Reconnection Settings
+AUTO_RECONNECT = True
+RECONNECT_DELAY = 2  # seconds
+
+#logs
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('face_tracker.log'),
+        logging.StreamHandler() 
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# cf
+URI = 'serial://ttyAMA0'
+PAR = 'rpi_cpx.rPiAngle'
+# CHANGE IN LIBRARY:
+# /home/admin/face_tracker/venv/lib/python3.11/site-packages/cflib/crtp/serialdriver.py
+# self.cpx = CPX(UARTTransport(device, 9600))
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+def console_callback(text: str):
+    logger.debug(f"CF Console: {text.strip()}")
+
+def connect_crazyflie(uri):
+    try:
+        SerialDriver.BAUD_RATE = 9600
+        cflib.crtp.init_drivers(enable_serial_driver=True)
+        
+        cf = Crazyflie(rw_cache='./cache')
+        cf.console.receivedChar.add_callback(console_callback)
+
+        scf = SyncCrazyflie(URI, cf=cf).__enter__()
+
+        return scf
+    
+    except Exception as e:
+        logger.info(f" Error connecting to Crazyflie: {e}")
+        return -1
+    
+def send_angle_to_crazyflie(scf, angle_deg):
+    cf = scf.cf
+    if scf is None:
+        logger.info("Angle:", angle_deg)
+        return False
+    if scf == -1:
+        logger.info("Crazyflie connection failed, cannot send angle.")
+        return False
+    else:
+        try:
+            cf.param.set_value(PAR, angle_deg)
+            logger.info(f"Set {PAR}: {angle_deg}")
+            time.sleep(0.001)
+            #logger.info(cf.param.get_value(PAR))
+            return True
+        except Exception as e:
+            logger.info(f" Error sending angle to Crazyflie: {e}")
+            return False
+
+
+def predict(width, height, confidences, boxes, prob_threshold, iou_threshold=0.3, top_k=-1):
+    boxes, confidences = boxes[0], confidences[0]
+    picked_box_probs, picked_labels = [], []
+    
+    for class_index in range(1, confidences.shape[1]):
+        probs = confidences[:, class_index]
+        mask = probs > prob_threshold
+        probs = probs[mask]
+        if probs.shape[0] == 0: continue
+        
+        subset_boxes = boxes[mask, :]
+        box_probs = np.concatenate([subset_boxes, probs.reshape(-1, 1)], axis=1)
+        box_probs = box_utils.hard_nms(box_probs, iou_threshold=iou_threshold, top_k=top_k)
+        picked_box_probs.append(box_probs)
+        picked_labels.extend([class_index] * box_probs.shape[0])
+    
+    if not picked_box_probs:
+        return np.array([]), np.array([]), np.array([])
+    
+    picked_box_probs = np.concatenate(picked_box_probs)
+    picked_box_probs[:, [0, 2]] *= width
+    picked_box_probs[:, [1, 3]] *= height
+    return picked_box_probs[:, :4].astype(np.int32), np.array(picked_labels), picked_box_probs[:, 4]
+
+def prepare_frame(frame):
+    """Convert camera frame to BGR format"""
+    if len(frame.shape) == 2:
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif frame.shape[2] == 4:
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    return frame
+
+def preprocess_for_inference(image):
+    """Prepare image for ONNX model"""
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, (320, 240))
+    image = (image.astype(np.float32) - 127.0) / 128.0
+    image = np.transpose(image, [2, 0, 1])
+    return np.expand_dims(image, axis=0)
+
+def create_stream_process():
+    """Create FFmpeg streaming process with low-latency settings"""
+    stream_url = f"{STREAM_PROTOCOL}://{'0.0.0.0' if STREAM_PROTOCOL == 'tcp' else IP}:{PORT}"
+    stream_url += "?listen=1" if STREAM_PROTOCOL == "tcp" else "?pkt_size=1316&broadcast=1"
+
+    # NOVINKA?
+
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+        '-r', str(FRAME_RATE),
+        '-i', '-',
+        '-c:v', 'h264_v4l2m2m',  # ← Hardware encoder!
+        '-num_output_buffers', '32',
+        '-num_capture_buffers', '16',
+        '-b:v', BITRATE,
+        # Remove CRF, preset, tune - not supported by hw encoder
+        '-pix_fmt', 'yuv420p',
+        '-g', str(FRAME_RATE * 2),
+        '-f', 'mpegts',
+        stream_url
+    ] 
+    
+    """
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+        '-r', str(FRAME_RATE),
+        '-i', '-',
+        '-c:v', 'libx264',
+        '-preset', VIDEO_PRESET,
+        '-tune', 'zerolatency',
+        '-crf', str(VIDEO_QUALITY),
+        '-b:v', BITRATE,
+        '-maxrate', BITRATE,
+        '-bufsize', f"{int(BITRATE[:-1]) * 2}k",
+        '-pix_fmt', 'yuv420p',
+        '-g', str(FRAME_RATE * 2),  # Keyframe interval
+        '-sc_threshold', '0',
+        '-f', 'mpegts',
+        stream_url
+    ]
+    """
+    return subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+logger.info("Initializing...")
+
+picam2 = None
+cap = None
+stream_proc = None
+
+# AI Model & Tracker
+tracker = Sort(max_age=MAX_AGE, min_hits=MIN_HITS, iou_threshold=IOU_THRESHOLD)
+sess_options = ort.SessionOptions()
+sess_options.intra_op_num_threads = ONNX_THREADS
+ort_session = ort.InferenceSession(MODEL_PATH, sess_options)
+input_name = ort_session.get_inputs()[0].name
+
+# Calculate derived parameters
+focal_length_px = (FRAME_WIDTH / 2.0) / math.tan(math.radians(HFOV_DEGREES / 2.0))
+deadzone_pixels = int(math.tan(math.radians(DEADZONE_DEGREES)) * focal_length_px)
+frame_center_x = FRAME_WIDTH // 2
+
+# Initial stream
+if STREAM_PROTOCOL != "none":
+    stream_proc = create_stream_process()
+    logger.info(f">>> Streaming to {STREAM_PROTOCOL.upper()}:{PORT} <<<")
+    logger.info(f">>> Quality: CRF={VIDEO_QUALITY}, Bitrate={BITRATE} <<<\n")
+
+
+if RUN_TARGET == "rpi":
+        # Camera
+        picam2 = Picamera2()
+        config = picam2.create_video_configuration(
+            main={"size": (FRAME_WIDTH, FRAME_HEIGHT)}
+        )
+        picam2.configure(config)
+        
+        picam2.set_controls({
+            "AeExposureMode" : 1,  # short
+            "AeEnable": True,      # auto exposure   
+            "AeConstraintMode": 0  # Normal constraint mode
+        })
+        
+        picam2.start()
+else:
+    # Load a prerecorded file when running on the PC.
+    logger.info(f">>> PC MODE - Running from local video file: {PC_VIDEO_PATH} <<<")
+    cap = cv2.VideoCapture(PC_VIDEO_PATH)
+    if not cap.isOpened():
+        logger.info(f"Error: Could not open video file: {PC_VIDEO_PATH}")
+        exit(1)
+        
+scf = None
+if ENABLE_CRAZYFLIE:
+    scf = connect_crazyflie(URI)
+    if scf == -1:
+        logger.info("Failed to connect to Crazyflie")
+
+# ============================================================================
+# MAIN LOOP
+# ============================================================================
+locked_target_id = None
+last_target_pos = None
+stream_active = True
+
+try:
+    while True:
+        t0 = time.perf_counter()
+        
+        # Capture & prepare frame
+        if RUN_TARGET == "rpi":
+            frame = picam2.capture_array()
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+        if frame is None: continue
+        orig_image = prepare_frame(frame)
+        
+        # Run inference
+        image = preprocess_for_inference(orig_image)
+        confidences, boxes = ort_session.run(None, {input_name: image})
+        boxes, labels, probs = predict(FRAME_WIDTH, FRAME_HEIGHT, confidences, boxes, CONFIDENCE_THRESHOLD, IOU_THRESHOLD)
+        
+        # Track objects
+        dets = np.concatenate((boxes, probs.reshape(-1, 1)), axis=1) if boxes.shape[0] > 0 else np.empty((0, 5))
+        tracked_objects = tracker.update(dets)
+        
+        # Draw deadzone markers
+        cv2.line(orig_image, (frame_center_x - deadzone_pixels, 0), (frame_center_x - deadzone_pixels, FRAME_HEIGHT), (255, 0, 0), 1)
+        cv2.line(orig_image, (frame_center_x + deadzone_pixels, 0), (frame_center_x + deadzone_pixels, FRAME_HEIGHT), (255, 0, 0), 1)
+        
+        # Target locking & drawing
+        if len(tracked_objects) > 0:
+            current_ids = [int(obj[4]) for i, obj in enumerate(tracked_objects)]
+            
+            # Check if we need to relock
+            if locked_target_id is None or locked_target_id not in current_ids:
+                if last_target_pos is not None:
+                    # Find face closest to last known position
+                    min_dist = float('inf')
+                    best_id = None
+                    
+                    for obj in tracked_objects:
+                        x1, y1, x2, y2, obj_id = [int(i) for i in obj]
+                        current_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                        
+                        # Euclidean distance from last known position
+                        dist = math.sqrt(
+                            (current_center[0] - last_target_pos[0])**2 + 
+                            (current_center[1] - last_target_pos[1])**2
+                        )
+                        
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_id = int(obj_id)
+                    
+                    locked_target_id = best_id
+                else:
+                    # No history - pick the most centered face
+                    center_dists = []
+                    for obj in tracked_objects:
+                        x1, y1, x2, y2, obj_id = [int(i) for i in obj]
+                        center_x = (x1 + x2) // 2
+                        dist_from_center = abs(center_x - frame_center_x)
+                        center_dists.append((dist_from_center, int(obj_id)))
+                    
+                    locked_target_id = min(center_dists, key=lambda x: x[0])[1]
+            
+            #if locked_target_id not in current_ids:
+            #    locked_target_id = current_ids[0]
+            
+            for obj in tracked_objects:
+                x1, y1, x2, y2, obj_id = [int(i) for i in obj]
+                is_target = (obj_id == locked_target_id)
+                color = (0, 0, 255) if is_target else (255, 0, 0)
+                cv2.rectangle(orig_image, (x1, y1), (x2, y2), color, 2)
+                
+                if is_target:
+                    last_target_pos = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    target_x = (x1 + x2) // 2
+                    error_x = target_x - frame_center_x
+                    angle_deg = math.degrees(math.atan(error_x / focal_length_px))
+
+                    send_angle_to_crazyflie(scf, angle_deg)
+                    
+                    pivot = (frame_center_x, FRAME_HEIGHT - 40)
+                    arrow_col = (0, 255, 0) if abs(angle_deg) < DEADZONE_DEGREES else (0, 0, 255)
+                    visual_angle = 270 + angle_deg
+                    end_x = int(pivot[0] + 60 * math.cos(math.radians(visual_angle)))
+                    end_y = int(pivot[1] + 60 * math.sin(math.radians(visual_angle)))
+                    cv2.arrowedLine(orig_image, pivot, (end_x, end_y), arrow_col, 3)
+        
+        # Stream frame with reconnection logic
+        if STREAM_PROTOCOL != "none" and stream_proc is not None:
+            try:
+                stream_proc.stdin.write(orig_image.tobytes())
+                if not stream_active:
+                    logger.info(">>> Stream reconnected <<<")
+                    stream_active = True
+            except (BrokenPipeError, OSError) as e:
+                if stream_active:
+                    logger.info(f"\n>>> Stream disconnected, waiting for viewer... <<<")
+                    stream_active = False
+                
+                if AUTO_RECONNECT:
+                    # Clean up old process
+                    try:
+                        stream_proc.stdin.close()
+                        stream_proc.terminate()
+                        stream_proc.wait(timeout=1)
+                    except:
+                        pass
+                    
+                    # Wait and create new stream
+                    time.sleep(RECONNECT_DELAY)
+                    stream_proc = create_stream_process()
+                    continue
+                else:
+                    break
+        else:
+            # display locally
+            cv2.imshow("RPI Camera Stream", orig_image)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        
+        fps = 1.0 / (time.perf_counter() - t0)
+        status = "LIVE" if stream_active else "WAITING"
+        print(f"[{status}] FPS: {fps:.1f} | Detections: {len(tracked_objects)}          ", end='\r')
+
+        if RUN_TARGET == "pc":
+            frame_time = time.perf_counter() - t0
+            target_frame_time = 1.0 / FRAME_RATE
+            if frame_time < target_frame_time:
+                time.sleep(target_frame_time - frame_time)
+
+except KeyboardInterrupt:
+    logger.info("\n\nStopping...")
+finally:
+    if picam2 is not None:
+        picam2.stop()
+    if cap is not None:
+        cap.release()
+    if stream_proc is not None:
+        try:
+            stream_proc.stdin.close()
+            stream_proc.terminate()
+            stream_proc.wait(timeout=2)
+        except:
+            stream_proc.kill()
+    if scf is not None:
+        scf.close_link()
