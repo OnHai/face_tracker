@@ -1,7 +1,7 @@
 
 
 # debugging
-RUN_TARGET = "pc"  # "rpi" or "pc"
+RUN_TARGET = "rpi"  # "rpi" or "pc"
 STREAM_PROTOCOL = "tcp"  # "tcp" or "udp" or "none"
 PC_VIDEO_PATH = r"sim_davu.mp4"
 ENABLE_CRAZYFLIE = True
@@ -225,7 +225,7 @@ else:
 locked_target_id = None
 last_target_pos = None
 stream_active = True
-
+angle_deg = 0.0
 try:
     while True:
         t0 = time.perf_counter()
