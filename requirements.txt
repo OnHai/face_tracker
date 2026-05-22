@@ -6,6 +6,5 @@ opencv-python-headless
 scipy
 scikit-image
 tqdm
-cflib
 pyserial
 picamera2
