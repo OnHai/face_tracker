@@ -1,7 +1,7 @@
 RUN_TARGET = "rpi"
 STREAM_PROTOCOL = "tcp"
 PC_VIDEO_PATH = r"test_tracking.mp4"
-ENABLE_CRAZYFLIE = False
+ENABLE_CRAZYFLIE = True
 
 import math
 import struct
@@ -75,7 +75,7 @@ def connect_crazyflie():
         print(f"Opened {port} at {baud}")
         return ser
     except Exception as e:
-        print(f"Error opening port: {e}")
+        TimeoutError(f"Error opening port: {e}")
         return None
 
 stop_requested = False
@@ -219,6 +219,7 @@ clahe_clip_limit = CLAHE_CLIP_LIMIT
 clahe_tile_size = CLAHE_TILE_SIZE
 
 if ENABLE_CRAZYFLIE:
+    print("start cf")
     ser = connect_crazyflie()
 else:
     ser = None
