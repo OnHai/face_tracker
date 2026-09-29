@@ -17,6 +17,8 @@ if RUN_TARGET == "rpi":
     from picamera2 import Picamera2
     import serial
 
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 IP = "0.0.0.0"
 PORT = 5005
 
@@ -268,6 +270,8 @@ TARGET_LOST_TIMEOUT = MAX_AGE / FRAME_RATE
 
 scale_x = FRAME_WIDTH / INFERENCE_W
 scale_y = FRAME_HEIGHT / INFERENCE_H
+
+last_control_check = time.perf_counter()
 
 try:
     while True:
